@@ -1,129 +1,25 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { ref, onValue } from "firebase/database";
-import { getDb } from "@/firebase";
+import {
+  BUILDING_MAX_CAPACITY,
+  FLOOR_MAX_CAPACITY,
+  FLOOR_NUMS,
+  type FloorRow,
+  getOccupancyPathLabel,
+  mergeToFiveFloors,
+} from "@/lib/occupancy";
 
-const FLOOR_NUMS = [1, 2, 3, 4, 5] as const;
+const POLL_INTERVAL_MS = 4000;
 
-/** Design capacity per floor (seats / fire code, etc.). */
-const FLOOR_MAX_CAPACITY: Record<(typeof FLOOR_NUMS)[number], number> = {
-  1: 235,
-  2: 160,
-  3: 210,
-  4: 120,
-  5: 250,
-};
-
-const BUILDING_MAX_CAPACITY = FLOOR_NUMS.reduce(
-  (s, n) => s + FLOOR_MAX_CAPACITY[n],
-  0
-);
-
-/** Trimmed path, or null = listen at DB root (e.g. Floor_1, Floor_2, …). */
-const OCCUPANCY_PATH_FOR_REF = (() => {
-  const raw = process.env.NEXT_PUBLIC_OCCUPANCY_PATH?.trim();
-  return raw && raw.length > 0 ? raw : null;
-})();
-
-const OCCUPANCY_PATH_LABEL =
-  OCCUPANCY_PATH_FOR_REF ??
-  "database root (e.g. Floor_1, Floor_2 with numeric values)";
-
-function isFloorOccupancyKey(key: string): boolean {
-  return /^\d+$/.test(key) || /^Floor_\d+$/i.test(key);
-}
-
-export type FloorRow = {
-  id: string;
-  label: string;
-  count: number;
-};
-
-function formatFloorLabel(key: string): string {
-  if (/^\d+$/.test(key)) return `Floor ${key}`;
-  return key
-    .replace(/[-_]/g, " ")
-    .replace(/\b\w/g, (c) => c.toUpperCase());
-}
-
-/** Map Firebase keys like `Floor_3` or `3` to floor index 1–5. */
-function floorNumberFromKey(key: string): number | null {
-  const m = key.match(/^Floor_(\d+)$/i);
-  if (m) {
-    const n = parseInt(m[1], 10);
-    return n >= 1 && n <= 5 ? n : null;
-  }
-  if (/^\d+$/.test(key)) {
-    const n = parseInt(key, 10);
-    return n >= 1 && n <= 5 ? n : null;
-  }
-  return null;
-}
-
-function parseFloors(
-  data: unknown,
-  opts: { restrictToFloorKeys: boolean }
-): FloorRow[] {
-  if (data == null || typeof data !== "object") return [];
-  const rows: FloorRow[] = [];
-  for (const [key, val] of Object.entries(data as Record<string, unknown>)) {
-    if (typeof val === "number" && !Number.isNaN(val)) {
-      if (opts.restrictToFloorKeys && !isFloorOccupancyKey(key)) continue;
-      rows.push({
-        id: key,
-        label: formatFloorLabel(key),
-        count: Math.max(0, Math.floor(val)),
-      });
-      continue;
+type OccupancyResponse =
+  | {
+      ok: true;
+      source: "live" | "demo";
+      pathLabel: string;
+      floors: FloorRow[];
     }
-    if (val && typeof val === "object" && "count" in val) {
-      if (opts.restrictToFloorKeys && !isFloorOccupancyKey(key)) continue;
-      const o = val as { count?: unknown; name?: unknown };
-      const n = Number(o.count);
-      if (!Number.isNaN(n)) {
-        const label =
-          typeof o.name === "string" && o.name.trim()
-            ? o.name.trim()
-            : formatFloorLabel(key);
-        rows.push({ id: key, label, count: Math.max(0, Math.floor(n)) });
-      }
-    }
-  }
-  return rows.sort((a, b) => {
-    const na = floorNumberFromKey(a.id);
-    const nb = floorNumberFromKey(b.id);
-    if (na != null && nb != null) return na - nb;
-    const tailA = a.id.match(/(\d+)$/)?.[1];
-    const tailB = b.id.match(/(\d+)$/)?.[1];
-    if (tailA != null && tailB != null) {
-      return parseInt(tailA, 10) - parseInt(tailB, 10);
-    }
-    return a.id.localeCompare(b.id, undefined, { numeric: true });
-  });
-}
-
-
-function mergeToFiveFloors(parsed: FloorRow[]): FloorRow[] {
-  const byNum = new Map<number, number>();
-  for (const row of parsed) {
-    const n = floorNumberFromKey(row.id);
-    if (n != null) byNum.set(n, row.count);
-  }
-  return FLOOR_NUMS.map((n) => ({
-    id: String(n),
-    label: `Floor ${n}`,
-    count: byNum.get(n) ?? 0,
-  }));
-}
-
-const DEMO_PARSED: FloorRow[] = [
-  { id: "1", label: "Floor 1", count: 142 },
-  { id: "2", label: "Floor 2", count: 98 },
-  { id: "3", label: "Floor 3", count: 76 },
-  { id: "4", label: "Floor 4", count: 54 },
-  { id: "5", label: "Floor 5", count: 31 },
-];
+  | { ok: false; error: string };
 
 function capacityPercentRaw(count: number, maxCap: number): number {
   if (maxCap <= 0) return 0;
@@ -146,52 +42,57 @@ function barFillClass(pct: number): string {
 }
 
 export function OccupancyDashboard() {
-  const [rawFloors, setRawFloors] = useState<FloorRow[]>([]);
+  const [floors, setFloors] = useState<FloorRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [usingDemo, setUsingDemo] = useState(false);
 
-  const hasDbUrl = Boolean(process.env.NEXT_PUBLIC_FIREBASE_DATABASE_URL);
+  const pathLabel = getOccupancyPathLabel();
 
   useEffect(() => {
-    if (!hasDbUrl) {
-      setRawFloors(DEMO_PARSED);
-      setUsingDemo(true);
-      setLoading(false);
-      return;
-    }
+    let cancelled = false;
+    let poll: ReturnType<typeof setInterval> | undefined;
 
-    const db = getDb();
-    if (!db) {
-      setRawFloors(DEMO_PARSED);
-      setUsingDemo(true);
-      setLoading(false);
-      return;
-    }
+    async function fetchOccupancy() {
+      try {
+        const res = await fetch("/api/occupancy", { cache: "no-store" });
+        const data = (await res.json()) as OccupancyResponse;
 
-    const r = OCCUPANCY_PATH_FOR_REF ? ref(db, OCCUPANCY_PATH_FOR_REF) : ref(db);
-    const restrictToFloorKeys = OCCUPANCY_PATH_FOR_REF == null;
-    setLoading(true);
-    setError(null);
-    setUsingDemo(false);
+        if (cancelled) return;
 
-    const unsub = onValue(
-      r,
-      (snap) => {
-        const parsed = parseFloors(snap.val(), { restrictToFloorKeys });
-        setRawFloors(parsed);
+        if (!data.ok) {
+          setError(data.error);
+          setFloors(mergeToFiveFloors([]));
+          setUsingDemo(false);
+          setLoading(false);
+          return;
+        }
+
+        setError(null);
+        setFloors(data.floors);
+        setUsingDemo(data.source === "demo");
         setLoading(false);
-      },
-      (err) => {
-        setError(err.message);
+
+        if (data.source === "live" && !poll && !cancelled) {
+          poll = setInterval(fetchOccupancy, POLL_INTERVAL_MS);
+        }
+      } catch (e) {
+        if (cancelled) return;
+        setError(e instanceof Error ? e.message : "Network error");
+        setFloors(mergeToFiveFloors([]));
+        setUsingDemo(false);
         setLoading(false);
       }
-    );
+    }
 
-    return () => unsub();
-  }, [hasDbUrl]);
+    setLoading(true);
+    fetchOccupancy();
 
-  const floors = useMemo(() => mergeToFiveFloors(rawFloors), [rawFloors]);
+    return () => {
+      cancelled = true;
+      if (poll) clearInterval(poll);
+    };
+  }, []);
 
   const total = useMemo(
     () => floors.reduce((s, f) => s + f.count, 0),
@@ -213,7 +114,7 @@ export function OccupancyDashboard() {
           </code>{" "}
           and write counts at{" "}
           <code className="rounded bg-white/10 px-1 font-mono text-xs text-amber-50">
-            {OCCUPANCY_PATH_LABEL}
+            {pathLabel}
           </code>{" "}
           for live occupancy.
         </p>
