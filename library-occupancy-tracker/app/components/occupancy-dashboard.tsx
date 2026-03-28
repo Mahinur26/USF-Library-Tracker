@@ -1,16 +1,28 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { ref, onValue } from "firebase/database";
+import { getDb } from "@/firebase";
+import {
+  FLOOR_PEAK_PROFILE,
+  formatPredictionTimeLabel,
+  predictNextHourRange,
+} from "@/lib/floor-insights";
 import {
   BUILDING_MAX_CAPACITY,
   FLOOR_MAX_CAPACITY,
   FLOOR_NUMS,
   type FloorRow,
-  getOccupancyPathLabel,
+  getOccupancyPathForRef,
   mergeToFiveFloors,
 } from "@/lib/occupancy";
 
-const POLL_INTERVAL_MS = 4000;
+/** Merge rapid RTDB events into a single GET (ms). */
+const FETCH_DEBOUNCE_MS = 150;
+
+const HEADER_BRAND = "University of South Florida";
+const HEADER_TAGLINE =
+  "Live occupancy metrics for the University of South Florida, Tampa Campus Library.";
 
 type OccupancyResponse =
   | {
@@ -41,17 +53,24 @@ function barFillClass(pct: number): string {
   return "bg-gradient-to-r from-emerald-600 to-[#34d399]";
 }
 
+function trendPhrase(t: "up" | "down" | "steady"): string {
+  if (t === "up") return "likely trending up";
+  if (t === "down") return "likely trending down";
+  return "likely steady";
+}
+
 export function OccupancyDashboard() {
   const [floors, setFloors] = useState<FloorRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [usingDemo, setUsingDemo] = useState(false);
-
-  const pathLabel = getOccupancyPathLabel();
+  const [insightsReady, setInsightsReady] = useState(false);
+  const [clock, setClock] = useState<Date | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    let poll: ReturnType<typeof setInterval> | undefined;
+    let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+    let unsub: (() => void) | undefined;
 
     async function fetchOccupancy() {
       try {
@@ -72,10 +91,6 @@ export function OccupancyDashboard() {
         setFloors(data.floors);
         setUsingDemo(data.source === "demo");
         setLoading(false);
-
-        if (data.source === "live" && !poll && !cancelled) {
-          poll = setInterval(fetchOccupancy, POLL_INTERVAL_MS);
-        }
       } catch (e) {
         if (cancelled) return;
         setError(e instanceof Error ? e.message : "Network error");
@@ -85,13 +100,62 @@ export function OccupancyDashboard() {
       }
     }
 
+    function scheduleFetchFromDb() {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        debounceTimer = undefined;
+        fetchOccupancy();
+      }, FETCH_DEBOUNCE_MS);
+    }
+
+    const hasDbUrl = Boolean(process.env.NEXT_PUBLIC_FIREBASE_DATABASE_URL);
+
     setLoading(true);
-    fetchOccupancy();
+
+    if (!hasDbUrl) {
+      fetchOccupancy();
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const db = getDb();
+    if (!db) {
+      fetchOccupancy();
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    const path = getOccupancyPathForRef();
+    const r = path ? ref(db, path) : ref(db);
+
+    unsub = onValue(
+      r,
+      () => {
+        scheduleFetchFromDb();
+      },
+      (err) => {
+        if (cancelled) return;
+        setError(err.message);
+        setFloors(mergeToFiveFloors([]));
+        setUsingDemo(false);
+        setLoading(false);
+      }
+    );
 
     return () => {
       cancelled = true;
-      if (poll) clearInterval(poll);
+      if (debounceTimer) clearTimeout(debounceTimer);
+      if (unsub) unsub();
     };
+  }, []);
+
+  useEffect(() => {
+    setClock(new Date());
+    setInsightsReady(true);
+    const id = setInterval(() => setClock(new Date()), 60_000);
+    return () => clearInterval(id);
   }, []);
 
   const total = useMemo(
@@ -105,30 +169,20 @@ export function OccupancyDashboard() {
   }, [total]);
 
   return (
-    <div className="w-full max-w-md px-4 py-10 sm:max-w-lg sm:px-6">
-      {usingDemo && (
-        <p className="mb-6 rounded-2xl border border-amber-500/25 bg-amber-950/35 px-3 py-2.5 text-center text-sm text-amber-100/95">
-          Showing sample data. Set{" "}
-          <code className="rounded bg-white/10 px-1 font-mono text-xs text-amber-50">
-            NEXT_PUBLIC_FIREBASE_DATABASE_URL
-          </code>{" "}
-          and write counts at{" "}
-          <code className="rounded bg-white/10 px-1 font-mono text-xs text-amber-50">
-            {pathLabel}
-          </code>{" "}
-          for live occupancy.
-        </p>
-      )}
-
+    <div className="w-full max-w-lg px-4 py-10 sm:max-w-xl sm:px-6">
+      
       <header className="mb-8 text-center">
         <p className="text-xs font-semibold uppercase tracking-[0.2em] text-[#34d399]">
-          USF Library
+          {HEADER_BRAND}
         </p>
         <h1 className="mt-2 font-[family-name:var(--font-geist-sans)] text-3xl font-bold tracking-tight text-white sm:text-4xl">
-          Occupancy by floor
+          USF Library Occupancy Tracker
         </h1>
-        <p className="mt-2 text-sm text-zinc-500">
-          Live headcount for levels 1–5
+        <p
+          className="mt-2 text-sm text-zinc-500"
+          suppressHydrationWarning
+        >
+          {HEADER_TAGLINE}
         </p>
       </header>
 
@@ -175,7 +229,7 @@ export function OccupancyDashboard() {
           </p>
         )}
 
-        <ul className="mt-5 flex flex-col gap-2.5 sm:gap-3" aria-label="Occupancy by floor">
+        <ul className="mt-3 flex flex-col gap-2.5 sm:gap-3" aria-label="Occupancy by floor">
           {loading && !usingDemo
             ? FLOOR_NUMS.map((n) => (
                 <li
@@ -199,10 +253,17 @@ export function OccupancyDashboard() {
                   maxCap > 0
                     ? Math.min(100, (floor.count / maxCap) * 100)
                     : 0;
+                const peak = FLOOR_PEAK_PROFILE[num];
+                const peakPct = capacityPercentRaw(peak.typicalPeakCount, maxCap);
+                const forecast =
+                  insightsReady && clock
+                    ? predictNextHourRange(floor.count, num, clock)
+                    : null;
                 return (
                   <li
                     key={floor.id}
-                    className="group rounded-xl border border-zinc-800/90 bg-gradient-to-br from-zinc-950/80 to-black/50 px-3 py-3 transition-colors hover:border-zinc-700/90 sm:px-4 sm:py-3.5"
+                    tabIndex={0}
+                    className="group/floor rounded-xl border border-zinc-800/90 bg-gradient-to-br from-zinc-950/80 to-black/50 px-3 py-3 outline-none transition-colors hover:border-emerald-500/25 focus-visible:border-emerald-500/30 focus-visible:ring-2 focus-visible:ring-emerald-500/25 sm:px-4 sm:py-3.5"
                   >
                     <div className="flex items-start gap-3 sm:gap-4">
                       <div
@@ -236,6 +297,62 @@ export function OccupancyDashboard() {
                             style={{ width: `${barW}%` }}
                           />
                         </div>
+                        
+                      </div>
+                    </div>
+
+                    <div className="grid grid-rows-[0fr] transition-[grid-template-rows] duration-200 ease-out group-hover/floor:grid-rows-[1fr] group-focus-within/floor:grid-rows-[1fr]">
+                      <div className="min-h-0 overflow-hidden">
+                        <div className="mt-3 space-y-2 border-t border-zinc-800/80 pt-3">
+                          <p className="text-[10px] font-semibold uppercase tracking-wider text-emerald-500/90">
+                            Typical peak traffic
+                          </p>
+                          <p className="text-xs leading-relaxed text-zinc-400">
+                            <span className="font-medium text-zinc-300">
+                              {peak.busiestDays}
+                            </span>
+                            <span className="text-zinc-600"> · </span>
+                            {peak.peakTimeRange}
+                          </p>
+                          <p className="text-xs text-zinc-400">
+                            <span className="tabular-nums font-medium text-zinc-200">
+                              ~{peak.typicalPeakCount.toLocaleString()} people
+                            </span>{" "}
+                            at peak
+                            <span className="text-zinc-500">
+                              {" "}
+                              (~{peakPct}% of this floor)
+                            </span>
+                          </p>
+                          <p className="text-xs text-zinc-500">
+                            Quieter: {peak.quieterDays}
+                          </p>
+
+                          {forecast && clock && (
+                            <>
+                              <p className="pt-1 text-[10px] font-semibold uppercase tracking-wider text-emerald-500/90">
+                                Next hour estimate
+                              </p>
+                              <p className="text-xs text-zinc-500">
+                                From{" "}
+                                <span className="text-zinc-400">
+                                  {formatPredictionTimeLabel(clock)} Tampa
+                                </span>
+                                , heuristic only
+                              </p>
+                              <p className="text-xs text-zinc-400">
+                                <span className="tabular-nums font-semibold text-zinc-200">
+                                  {forecast.low.toLocaleString()}–
+                                  {forecast.high.toLocaleString()} people
+                                </span>
+                                <span className="text-zinc-500">
+                                  {" "}
+                                  · {trendPhrase(forecast.trend)}
+                                </span>
+                              </p>
+                            </>
+                          )}
+                        </div>
                       </div>
                     </div>
                   </li>
@@ -244,9 +361,6 @@ export function OccupancyDashboard() {
         </ul>
       </div>
 
-      <p className="mt-6 text-center text-xs text-zinc-500">
-        Realtime USF library traffic.
-      </p>
     </div>
   );
 }
