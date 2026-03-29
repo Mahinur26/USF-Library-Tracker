@@ -23,7 +23,7 @@ int32_t total_entries     = 0;
 int32_t total_exits       = 0;
 int32_t current_occupancy = 0;
 
-const unsigned long SEND_INTERVAL_MS = 20000;
+const unsigned long SEND_INTERVAL_MS = 10000;
 unsigned long last_send_time         = 0;
 
 typedef struct {
