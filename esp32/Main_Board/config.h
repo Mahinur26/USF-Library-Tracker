@@ -5,7 +5,7 @@
 // Shared — used by both Main_Board and Support_Board
 // ---------------------------------------------------------------------------
 #define FLOOR_ID      "Floor_1"   // Must match the Firebase path key
-#define MAX_CAPACITY  120         // Max people this floor can hold
+#define MAX_CAPACITY  100         // Max people this floor can hold
 
 // ---------------------------------------------------------------------------
 // Main Board only — not needed on Support_Board

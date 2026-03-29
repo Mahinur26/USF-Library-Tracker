@@ -5,7 +5,7 @@
 // Shared — used by both Main_Board and Support_Board
 // ---------------------------------------------------------------------------
 #define FLOOR_ID      "Floor_1"
-#define MAX_CAPACITY  120
+#define MAX_CAPACITY  100
 
 // WiFi channel your router uses
 // Flash Main_Board first, check Serial for "[WiFi] Channel: X", put that number here
