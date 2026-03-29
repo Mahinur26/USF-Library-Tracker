@@ -10,11 +10,11 @@
 // ---------------------------------------------------------------------------
 // Main Board only — not needed on Support_Board
 // ---------------------------------------------------------------------------
-#define WIFI_SSID      "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD  "YOUR_WIFI_PASSWORD"
+#define WIFI_SSID      "Mahi"
+#define WIFI_PASSWORD  "Mahinur1"
 
 // Firebase Realtime Database
 // Found in Firebase Console → Project Settings → Service Accounts → Database Secret
 // or use the RTDB URL with no auth if your rules are open (not recommended)
-#define FIREBASE_HOST  "YOUR_PROJECT_ID.firebaseio.com"   // e.g. "usf-library.firebaseio.com"
-#define FIREBASE_AUTH  "YOUR_DATABASE_SECRET"             // Legacy secret or auth token
+#define FIREBASE_HOST  "usf-library-tracker-default-rtdb.firebaseio.com"   // e.g. "usf-library.firebaseio.com"
+#define FIREBASE_AUTH  ""             // Legacy secret or auth token
