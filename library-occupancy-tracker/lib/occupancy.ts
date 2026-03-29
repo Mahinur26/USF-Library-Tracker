@@ -1,12 +1,12 @@
 export const FLOOR_NUMS = [1, 2, 3, 4, 5] as const;
 
-/** Design capacity per floor (seats / fire code, etc.). */
+/** Fallback capacity per floor when RTDB does not send `max_capacity` (100 each). */
 export const FLOOR_MAX_CAPACITY: Record<(typeof FLOOR_NUMS)[number], number> = {
-  1: 235,
-  2: 160,
-  3: 210,
-  4: 120,
-  5: 250,
+  1: 100,
+  2: 100,
+  3: 100,
+  4: 100,
+  5: 100,
 };
 
 export const BUILDING_MAX_CAPACITY = FLOOR_NUMS.reduce(
@@ -14,24 +14,48 @@ export const BUILDING_MAX_CAPACITY = FLOOR_NUMS.reduce(
   0
 );
 
-/** Trimmed path, or null = listen at DB root (e.g. Floor_1, Floor_2, …). */
+/**
+ * RTDB path to the floors node. Default `floors` matches:
+ * `floors/Floor_N/{ current_occupancy, max_capacity, ... }`.
+ * Set `NEXT_PUBLIC_OCCUPANCY_PATH=/` or `.` to read flat keys at database root (legacy).
+ */
 export function getOccupancyPathForRef(): string | null {
   const raw = process.env.NEXT_PUBLIC_OCCUPANCY_PATH?.trim();
-  return raw && raw.length > 0 ? raw : null;
+  if (raw === "/" || raw === ".") return null;
+  if (raw && raw.length > 0) return raw;
+  return "floors";
 }
 
 export function getOccupancyPathLabel(): string {
-  return (
-    getOccupancyPathForRef() ??
-    "database root (e.g. Floor_1, Floor_2 with numeric values)"
-  );
+  const p = getOccupancyPathForRef();
+  if (p == null) return "database root (legacy flat Floor_1, …)";
+  return p;
 }
 
 export type FloorRow = {
   id: string;
   label: string;
   count: number;
+  /** From `floors/Floor_N/max_capacity` when present */
+  maxCapacityOverride?: number;
 };
+
+export function getFloorMaxCapacity(
+  row: FloorRow,
+  floorNum: (typeof FLOOR_NUMS)[number]
+): number {
+  return row.maxCapacityOverride ?? FLOOR_MAX_CAPACITY[floorNum];
+}
+
+/** Sum of per-floor max (DB override or fallback) for building %. */
+export function sumBuildingMaxCapacity(floors: FloorRow[]): number {
+  let s = 0;
+  for (const n of FLOOR_NUMS) {
+    const row = floors.find((f) => f.id === String(n));
+    if (row) s += getFloorMaxCapacity(row, n);
+  }
+  return s;
+}
 
 function isFloorOccupancyKey(key: string): boolean {
   return /^\d+$/.test(key) || /^Floor_\d+$/i.test(key);
@@ -74,6 +98,22 @@ export function parseFloors(
       });
       continue;
     }
+    if (val && typeof val === "object" && "current_occupancy" in val) {
+      if (opts.restrictToFloorKeys && !isFloorOccupancyKey(key)) continue;
+      const o = val as { current_occupancy?: unknown; max_capacity?: unknown };
+      const c = Number(o.current_occupancy);
+      if (Number.isNaN(c)) continue;
+      const maxRaw = Number(o.max_capacity);
+      const maxCap =
+        !Number.isNaN(maxRaw) && maxRaw > 0 ? Math.floor(maxRaw) : undefined;
+      rows.push({
+        id: key,
+        label: formatFloorLabel(key),
+        count: Math.max(0, Math.floor(c)),
+        maxCapacityOverride: maxCap,
+      });
+      continue;
+    }
     if (val && typeof val === "object" && "count" in val) {
       if (opts.restrictToFloorKeys && !isFloorOccupancyKey(key)) continue;
       const o = val as { count?: unknown; name?: unknown };
@@ -101,16 +141,27 @@ export function parseFloors(
 }
 
 export function mergeToFiveFloors(parsed: FloorRow[]): FloorRow[] {
-  const byNum = new Map<number, number>();
+  const byNum = new Map<number, FloorRow>();
   for (const row of parsed) {
     const n = floorNumberFromKey(row.id);
-    if (n != null) byNum.set(n, row.count);
+    if (n != null) byNum.set(n, row);
   }
-  return FLOOR_NUMS.map((n) => ({
-    id: String(n),
-    label: `Floor ${n}`,
-    count: byNum.get(n) ?? 0,
-  }));
+  return FLOOR_NUMS.map((n) => {
+    const existing = byNum.get(n);
+    if (existing) {
+      return {
+        id: String(n),
+        label: `Floor ${n}`,
+        count: existing.count,
+        maxCapacityOverride: existing.maxCapacityOverride,
+      };
+    }
+    return {
+      id: String(n),
+      label: `Floor ${n}`,
+      count: 0,
+    };
+  });
 }
 
 /** Sample rows before merge (ids 1–5). */
